@@ -5,306 +5,251 @@ const cors = require("cors");
 
 const app = express();
 app.use(cors());
+app.use(express.json());
+
+app.get("/", (req, res) => {
+  res.send("Jackaroo Server Running 🚀");
+});
 
 const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: {
     origin: "*",
+    methods: ["GET", "POST"],
   },
 });
 
-// ================= ROOMS =================
-let rooms = {};
+const PORT = process.env.PORT || 3001;
 
-// ================= CONNECTION =================
+/* ---------------- DATA ---------------- */
+
+const rooms = {};
+const shopItems = [
+  { id: 1, name: "Golden Dice", price: 50 },
+  { id: 2, name: "VIP Avatar", price: 100 },
+  { id: 3, name: "Legend Badge", price: 200 },
+];
+
+/* ---------------- HELPERS ---------------- */
+
+function createRoom(roomId) {
+  rooms[roomId] = {
+    id: roomId,
+    players: [],
+    turn: 0,
+    dice: null,
+    started: false,
+    chat: [],
+  };
+}
+
+function getPlayer(roomId, socketId) {
+  const room = rooms[roomId];
+  if (!room) return null;
+
+  return room.players.find((p) => p.id === socketId);
+}
+
+function emitRoom(roomId) {
+  io.to(roomId).emit("roomUpdate", rooms[roomId]);
+}
+
+/* ---------------- SOCKET ---------------- */
+
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
 
-  // ================= JOIN ROOM =================
-  socket.on("join_room", (roomId) => {
+  // Create Room
+  socket.on("create_room", ({ roomId, username }) => {
+    if (!rooms[roomId]) createRoom(roomId);
+
     socket.join(roomId);
 
-    if (!rooms[roomId]) {
-      rooms[roomId] = {
-        players: [],
-        turn: 0,
-      };
-    }
+    rooms[roomId].players.push({
+      id: socket.id,
+      name: username || "Host",
+      coins: 100,
+      inventory: [],
+      position: 0,
+      avatar: "default",
+    });
 
-    if (!rooms[roomId].players.includes(socket.id)) {
-      rooms[roomId].players.push(socket.id);
-    }
-
-    io.to(roomId).emit("room_update", rooms[roomId]);
+    emitRoom(roomId);
   });
 
-  // ================= DICE =================
-  socket.on("roll_dice", (roomId) => {
-    const dice = Math.floor(Math.random() * 6) + 1;
+  // Join Room
+  socket.on("joinRoom", ({ roomId, username }) => {
+    if (!rooms[roomId]) createRoom(roomId);
 
-    io.to(roomId).emit("dice_rolled", {
-      player: socket.id,
+    const room = rooms[roomId];
+
+    if (room.players.length >= 4) {
+      socket.emit("roomFull");
+      return;
+    }
+
+    socket.join(roomId);
+
+    room.players.push({
+      id: socket.id,
+      name: username || "Guest",
+      coins: 100,
+      inventory: [],
+      position: 0,
+      avatar: "default",
+    });
+
+    emitRoom(roomId);
+
+    io.to(roomId).emit("systemMessage", `${username} joined room`);
+  });
+
+  // Start Game
+  socket.on("startGame", ({ roomId }) => {
+    const room = rooms[roomId];
+    if (!room) return;
+
+    room.started = true;
+    room.turn = 0;
+
+    io.to(roomId).emit("gameStarted", room);
+  });
+
+  // Chat
+  socket.on("message", ({ roomId, username, message }) => {
+    const room = rooms[roomId];
+    if (!room) return;
+
+    const msg = {
+      username,
+      message,
+      time: Date.now(),
+    };
+
+    room.chat.push(msg);
+
+    io.to(roomId).emit("message", msg);
+  });
+
+  // Dice
+  socket.on("rollDice", ({ roomId }) => {
+    const room = rooms[roomId];
+    if (!room) return;
+
+    const current = room.players[room.turn];
+    if (!current || current.id !== socket.id) return;
+
+    const dice = Math.floor(Math.random() * 6) + 1;
+    room.dice = dice;
+
+    io.to(roomId).emit("diceRolled", {
+      playerId: socket.id,
       value: dice,
     });
   });
 
-  // ================= TURN =================
-  socket.on("next_turn", (roomId) => {
+  // Move Piece
+  socket.on("movePiece", ({ roomId }) => {
     const room = rooms[roomId];
     if (!room) return;
 
+    const player = room.players[room.turn];
+    if (!player || player.id !== socket.id) return;
+    if (!room.dice) return;
+
+    player.position += room.dice;
+
+    if (player.position >= 24) {
+      player.position = 24;
+      player.coins += 50;
+
+      io.to(roomId).emit("winner", {
+        player: player.name,
+        coins: player.coins,
+      });
+    }
+
+    io.to(roomId).emit("pieceMoved", {
+      playerId: socket.id,
+      position: player.position,
+    });
+
+    room.dice = null;
     room.turn = (room.turn + 1) % room.players.length;
 
-    io.to(roomId).emit("turn_update", {
-      turn: room.turn,
-      currentPlayer: room.players[room.turn],
+    emitRoom(roomId);
+  });
+
+  // Buy Shop Item
+  socket.on("buyItem", ({ roomId, itemId }) => {
+    const room = rooms[roomId];
+    if (!room) return;
+
+    const player = getPlayer(roomId, socket.id);
+    if (!player) return;
+
+    const item = shopItems.find((x) => x.id === itemId);
+    if (!item) return;
+
+    if (player.coins >= item.price) {
+      player.coins -= item.price;
+      player.inventory.push(item);
+
+      socket.emit("buySuccess", {
+        coins: player.coins,
+        inventory: player.inventory,
+      });
+    } else {
+      socket.emit("buyFail");
+    }
+
+    emitRoom(roomId);
+  });
+
+  // Voice Chat Signaling
+  socket.on("voice-offer", ({ roomId, offer }) => {
+    socket.to(roomId).emit("voice-offer", {
+      from: socket.id,
+      offer,
     });
   });
 
-  // ================= MOVE PIECE =================
-  socket.on("move_piece", ({ roomId, data }) => {
-    socket.to(roomId).emit("opponent_move", data);
-  });
-
-  // ================= CHAT =================
-  socket.on("send_message", ({ roomId, message, user }) => {
-    io.to(roomId).emit("receive_message", {
-      user,
-      message,
-      time: Date.now(),
+  socket.on("voice-answer", ({ roomId, answer }) => {
+    socket.to(roomId).emit("voice-answer", {
+      from: socket.id,
+      answer,
     });
   });
 
-  // ================= VOICE CHAT (WEBRTC SIGNALING) =================
-
-  socket.on("voice_join", (roomId) => {
-    socket.join(roomId);
-    socket.to(roomId).emit("user_joined_voice", socket.id);
-  });
-
-  socket.on("voice_offer", (data) => {
-    socket.to(data.roomId).emit("voice_offer", {
-      offer: data.offer,
-      sender: socket.id,
+  socket.on("voice-ice", ({ roomId, candidate }) => {
+    socket.to(roomId).emit("voice-ice", {
+      from: socket.id,
+      candidate,
     });
   });
 
-  socket.on("voice_answer", (data) => {
-    socket.to(data.roomId).emit("voice_answer", {
-      answer: data.answer,
-      sender: socket.id,
-    });
-  });
-
-  socket.on("voice_ice", (data) => {
-    socket.to(data.roomId).emit("voice_ice", {
-      candidate: data.candidate,
-      sender: socket.id,
-    });
-  });
-
-  // ================= DISCONNECT =================
+  // Disconnect
   socket.on("disconnect", () => {
-    console.log("User disconnected:", socket.id);
+    console.log("Disconnected:", socket.id);
 
-    for (let roomId in rooms) {
-      rooms[roomId].players = rooms[roomId].players.filter(
-        (p) => p !== socket.id
-      );
+    for (const roomId in rooms) {
+      const room = rooms[roomId];
+
+      room.players = room.players.filter((p) => p.id !== socket.id);
+
+      if (room.players.length === 0) {
+        delete rooms[roomId];
+      } else {
+        room.turn = 0;
+        emitRoom(roomId);
+      }
     }
   });
 });
 
-// ================= START SERVER =================
-server.listen(3001, () => {
-  console.log("🚀 Jackaroo server running on port 3001");
-});
-socket.on("create_room", () => {
-  const roomId = Math.random().toString(36).substring(2, 8);
+/* ---------------- START ---------------- */
 
-  rooms[roomId] = {
-    players: [],
-    turn: 0,
-  };
-
-  socket.join(roomId);
-  rooms[roomId].players.push(socket.id);
-
-  socket.emit("room_created", roomId);
-});
-socket.on("join_room", (roomId) => {
-  socket.join(roomId);
-
-  if (!rooms[roomId]) {
-    rooms[roomId] = { players: [], turn: 0 };
-  }
-
-  rooms[roomId].players.push(socket.id);
-
-  io.to(roomId).emit("room_update", rooms[roomId]);
-});
-let gameState = {};
-socket.on("join_room", (roomId) => {
-  socket.join(roomId);
-
-  if (!rooms[roomId]) {
-    rooms[roomId] = {
-      players: [],
-      turn: 0,
-    };
-  }
-
-  if (!gameState[roomId]) {
-    gameState[roomId] = {};
-  }
-
-  if (!rooms[roomId].players.includes(socket.id)) {
-    rooms[roomId].players.push(socket.id);
-  }
-
-  io.to(roomId).emit("room_update", rooms[roomId]);
-});
-socket.on("check_win", ({ roomId, playerId, finishedPieces }) => {
-  if (finishedPieces === 4) {
-    io.to(roomId).emit("game_over", {
-      winner: playerId,
-    });
-
-    // reset room
-    rooms[roomId] = {
-      players: rooms[roomId].players,
-      turn: 0,
-    };
-  }
-});
-const finished = {};
-if (piece.index === 0 && steps <= 0) {
-  finished[piece.playerId] = (finished[piece.playerId] || 0) + 1;
-
-  socket.emit("check_win", {
-    roomId: "test123",
-    playerId: piece.playerId,
-    finishedPieces: finished[piece.playerId],
-  });
-}
-socket.on("game_over", (data) => {
-  alert("🏆 Winner: Player " + data.winner);
-
-  // oyunu restart et
-  window.location.href = "/lobby";
-});
-let coins = {};
-socket.on("join_room", (roomId) => {
-  socket.join(roomId);
-
-  if (!coins[socket.id]) {
-    coins[socket.id] = 100; // 🔥 start coin
-  }
-
-  if (!rooms[roomId]) {
-    rooms[roomId] = {
-      players: [],
-      turn: 0,
-    };
-  }
-
-  if (!rooms[roomId].players.includes(socket.id)) {
-    rooms[roomId].players.push(socket.id);
-  }
-
-  io.to(socket.id).emit("coin_update", coins[socket.id]);
-
-  io.to(roomId).emit("room_update", rooms[roomId]);
-});
-socket.on("check_win", ({ roomId, playerId, finishedPieces }) => {
-  if (finishedPieces === 4) {
-
-    // 💰 reward
-    coins[playerId] += 50;
-
-    io.to(roomId).emit("game_over", {
-      winner: playerId,
-      reward: 50
-    });
-
-    io.to(playerId).emit("coin_update", coins[playerId]);
-
-    // reset room
-    rooms[roomId] = {
-      players: rooms[roomId].players,
-      turn: 0,
-    };
-  }
-});
-let profiles = {};
-socket.on("join_room", (roomId) => {
-  socket.join(roomId);
-
-  // 👤 PROFILE CREATE
-  if (!profiles[socket.id]) {
-    profiles[socket.id] = {
-      name: "Player-" + socket.id.slice(0, 4),
-      avatar: 1,
-      coins: 100,
-    };
-  }
-
-  if (!rooms[roomId]) {
-    rooms[roomId] = {
-      players: [],
-      turn: 0,
-    };
-  }
-
-  if (!rooms[roomId].players.includes(socket.id)) {
-    rooms[roomId].players.push(socket.id);
-  }
-
-  io.to(roomId).emit("room_update", {
-    players: rooms[roomId].players.map((id) => profiles[id]),
-  });
-});
-socket.on("update_profile", (data) => {
-  if (!profiles[socket.id]) return;
-
-  profiles[socket.id] = {
-    ...profiles[socket.id],
-    ...data,
-  };
-
-  socket.emit("profile_update", profiles[socket.id]);
-});
-let shopItems = [
-  { id: 1, name: "Red Avatar", price: 50 },
-  { id: 2, name: "Blue Avatar", price: 50 },
-  { id: 3, name: "Golden Skin", price: 100 },
-];
-
-let inventory = {};
-socket.on("get_shop", () => {
-  socket.emit("shop_data", shopItems);
-});
-socket.on("buy_item", ({ itemId }) => {
-  const item = shopItems.find((i) => i.id === itemId);
-  if (!item) return;
-
-  if (!coins[socket.id]) coins[socket.id] = 100;
-
-  if (coins[socket.id] < item.price) {
-    socket.emit("buy_result", { success: false });
-    return;
-  }
-
-  coins[socket.id] -= item.price;
-
-  if (!inventory[socket.id]) inventory[socket.id] = [];
-
-  inventory[socket.id].push(item);
-
-  socket.emit("buy_result", {
-    success: true,
-    coins: coins[socket.id],
-    inventory: inventory[socket.id],
-  });
+server.listen(PORT, () => {
+  console.log("🚀 Jackaroo Server Running On Port", PORT);
 });
